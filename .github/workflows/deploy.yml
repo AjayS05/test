@@ -1,0 +1,75 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Copy repo files to the VM (no git on VM, no pull)
+      - name: Copy files to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "."
+          target: ${{ secrets.DEPLOY_PATH || '/opt/hello-api' }}
+          strip_components: 0
+          overwrite: true
+          rm: true
+          exclude: |
+            **/.git**
+            **/.github/**
+            node_modules
+
+      # Install runtime and (re)start the app on port 80 with PM2
+      - name: Configure and start service on VM
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            # 1) Node & PM2
+            if ! command -v node >/dev/null 2>&1; then
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+            sudo npm i -g pm2
+
+            # 2) App directory
+            APP_DIR="${DEPLOY_PATH:-/opt/hello-api}"
+            sudo mkdir -p "$APP_DIR"
+            sudo chown -R $USER:$USER "$APP_DIR"
+
+            cd "$APP_DIR"
+            # Clean install (fallback to npm install if lock not present)
+            npm ci --omit=dev || npm install --omit=dev
+
+            # 3) Allow node to bind to port 80 without running as root
+            NODE_BIN=$(readlink -f "$(which node)")
+            sudo setcap 'cap_net_bind_service=+ep' "$NODE_BIN" || true
+
+            # 4) Start or restart with PM2 (process name: hello-api)
+            if pm2 list | grep -q "hello-api"; then
+              pm2 restart hello-api
+            else
+              pm2 start npm --name "hello-api" -- start
+            fi
+            pm2 save
+
+            # 5) Auto-start on reboot
+            sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u $USER --hp $HOME -y >/dev/null 2>&1 || true
+
+            # 6) Open port 80 if UFW is active
+            if command -v ufw >/dev/null 2>&1 && sudo ufw status | grep -q active; then
+              sudo ufw allow 80/tcp || true
+            fi
