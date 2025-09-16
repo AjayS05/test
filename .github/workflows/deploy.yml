@@ -13,36 +13,42 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2) Copy repo contents to VM (flatten to target)
-      - name: Copy files to VM (SCP)
+      # 2) Create a tarball to avoid copy issues
+      - name: Create deploy tarball
+        run: |
+          tar --exclude='.git' --exclude='.github' --exclude='node_modules' -czf app.tar.gz .
+
+      # 3) Upload tarball to VM
+      - name: Upload tarball to VM
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          source: "."
-          target: ${{ secrets.DEPLOY_PATH || '/opt/hello-api' }}
-          rm: true
-          strip_components: 1
-          overwrite: true
+          source: "app.tar.gz"
+          target: "/home/azureuser/"
 
-      # 3) Install Node.js and start app
-      - name: Configure and start service on VM
+      # 4) Extract, install, and start app
+      - name: Deploy & start app on VM
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             set -e
 
-            APP_DIR="${DEPLOY_PATH:-/opt/hello-api}"
-            sudo mkdir -p "$APP_DIR"
-            sudo chown -R $USER:$USER "$APP_DIR"
+            APP_DIR="/home/azureuser/hello-api"
+            TAR_PATH="/home/azureuser/app.tar.gz"
 
-            echo "==> Listing files after copy"
+            echo "==> Preparing app dir"
+            mkdir -p "$APP_DIR"
+
+            echo "==> Extracting tarball into $APP_DIR"
+            tar -xzf "$TAR_PATH" -C "$APP_DIR"
+            rm -f "$TAR_PATH"
+
+            echo "==> Listing files"
             ls -la "$APP_DIR"
 
             if [ ! -f "$APP_DIR/package.json" ]; then
@@ -56,7 +62,7 @@ jobs:
               sudo apt-get install -y nodejs
             fi
 
-            # Install pm2 if missing
+            # Install PM2 if missing
             if ! command -v pm2 >/dev/null 2>&1; then
               sudo npm install -g pm2
             fi
@@ -66,8 +72,15 @@ jobs:
             echo "==> Installing dependencies"
             npm install --omit=dev
 
-            NODE_BIN=$(readlink -f "$(which node)")
-            sudo setcap 'cap_net_bind_service=+ep' "$NODE_BIN" || true
+            # Ensure app.js listens on 0.0.0.0:80
+            if ! grep -q "0.0.0.0" app.js; then
+              echo "WARNING: app.js may not bind to 0.0.0.0. Please check manually."
+            fi
+
+            # Give Node binary permission for port 80
+            for p in /usr/bin/node /usr/local/bin/node "$(readlink -f "$(which node)")"; do
+              [ -x "$p" ] && sudo setcap 'cap_net_bind_service=+ep' "$p" || true
+            done
 
             echo "==> Starting app with PM2"
             if pm2 list | grep -q "hello-api"; then
@@ -77,8 +90,13 @@ jobs:
             fi
             pm2 save
 
-            sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u $USER --hp $HOME -y >/dev/null 2>&1 || true
+            echo "==> PM2 status"
+            pm2 status
 
-            if command -v ufw >/dev/null 2>&1 && sudo ufw status | grep -q active; then
-              sudo ufw allow 80/tcp || true
-            fi
+            echo "==> Checking if port 80 is open"
+            sudo ss -ltnp | grep ':80' || true
+
+            echo "==> Local test inside VM"
+            curl -i http://localhost/sayHello || true
+
+            echo "==> Deployment finished"
