@@ -11,54 +11,59 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Copy repo files to the VM (no git on VM, no pull)
+      # 1) Copy repo to VM (no git pull on VM)
       - name: Copy files to VM
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # uncomment next line ONLY if your .pem has a passphrase
+          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
           source: "."
           target: ${{ secrets.DEPLOY_PATH || '/opt/hello-api' }}
+          rm: true
           strip_components: 0
           overwrite: true
-          rm: true
-          exclude: |
-            **/.git**
-            **/.github/**
-            node_modules
 
-      # Install runtime and (re)start the app on port 80 with PM2
+      # 2) Setup runtime and (re)start app on port 80
       - name: Configure and start service on VM
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             set -e
 
-            # 1) Node & PM2
+            # Node & PM2
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               sudo apt-get install -y nodejs
             fi
             sudo npm i -g pm2
 
-            # 2) App directory
             APP_DIR="${DEPLOY_PATH:-/opt/hello-api}"
             sudo mkdir -p "$APP_DIR"
             sudo chown -R $USER:$USER "$APP_DIR"
-
             cd "$APP_DIR"
-            # Clean install (fallback to npm install if lock not present)
-            npm ci --omit=dev || npm install --omit=dev
 
-            # 3) Allow node to bind to port 80 without running as root
+            # optional cleanup if you dislike CI files on the VM
+            rm -rf .git || true
+
+            # install deps
+            if [ -f package-lock.json ]; then
+              npm ci --omit=dev
+            else
+              npm install --omit=dev
+            fi
+
+            # allow binding to port 80
             NODE_BIN=$(readlink -f "$(which node)")
             sudo setcap 'cap_net_bind_service=+ep' "$NODE_BIN" || true
 
-            # 4) Start or restart with PM2 (process name: hello-api)
+            # start/restart via PM2
             if pm2 list | grep -q "hello-api"; then
               pm2 restart hello-api
             else
@@ -66,10 +71,10 @@ jobs:
             fi
             pm2 save
 
-            # 5) Auto-start on reboot
+            # autostart on reboot
             sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u $USER --hp $HOME -y >/dev/null 2>&1 || true
 
-            # 6) Open port 80 if UFW is active
+            # open port 80 if ufw is active
             if command -v ufw >/dev/null 2>&1 && sudo ufw status | grep -q active; then
               sudo ufw allow 80/tcp || true
             fi
