@@ -13,54 +13,79 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2) Rsync code to VM (no git pull on VM)
-      - name: Sync files to VM with rsync
-        uses: burnett01/rsync-deployments@5.2
+      # 2) Copy code to VM (no git pull on VM)
+      - name: Copy files to VM (SCP)
+        uses: appleboy/scp-action@v0.1.7
         with:
-          switches: -avz --delete --exclude '.git*' --exclude '.github*' --exclude 'node_modules'
-          path: .
-          remote_path: ${{ secrets.DEPLOY_PATH || '/opt/hello-api' }}
-          remote_host: ${{ secrets.SSH_HOST }}
-          remote_user: ${{ secrets.SSH_USERNAME }}
-          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # passphrase: ${{ secrets.SSH_PASSPHRASE }}   # <-- uncomment if your .pem has a passphrase
+          source: "./*"
+          target: ${{ secrets.DEPLOY_PATH || '/opt/hello-api' }}
+          rm: true
+          strip_components: 0
+          overwrite: true
 
-      # 3) Install Node & start app
+      # 3) Install Node.js and (re)start app on port 80 with PM2
       - name: Configure and start service on VM
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # passphrase: ${{ secrets.SSH_PASSPHRASE }}   # uncomment if key is passphrase-protected
+          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             set -e
 
-            # Ensure Node.js & npm installed
+            # Set app dir from secret or default
+            APP_DIR="${DEPLOY_PATH:-/opt/hello-api}"
+
+            # If you prefer to avoid permissions issues with /opt,
+            # set DEPLOY_PATH secret to: /home/azureuser/hello-api
+            # and this will just work without sudo.
+            sudo mkdir -p "$APP_DIR"
+            sudo chown -R $USER:$USER "$APP_DIR"
+
+            echo "==> Listing files to verify copy landed:"
+            ls -la "$APP_DIR"
+
+            # Quick sanity check to avoid ENOENT package.json
+            if [ ! -f "$APP_DIR/package.json" ]; then
+              echo "ERROR: package.json not found in $APP_DIR"
+              exit 1
+            fi
+
+            # Install Node.js if missing (Ubuntu/Debian style)
             if ! command -v node >/dev/null 2>&1; then
+              echo "==> Installing Node.js 20.x"
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               sudo apt-get install -y nodejs
             fi
 
-            # Install pm2 globally if not present
+            # Install pm2 if missing
             if ! command -v pm2 >/dev/null 2>&1; then
+              echo "==> Installing PM2"
               sudo npm install -g pm2
             fi
 
-            APP_DIR="${DEPLOY_PATH:-/opt/hello-api}"
             cd "$APP_DIR"
 
-            # Install app dependencies
+            # Optional: remove .git folder on server (cosmetic)
+            rm -rf .git || true
+
+            echo "==> Installing app dependencies"
             if [ -f package-lock.json ]; then
               npm ci --omit=dev
             else
               npm install --omit=dev
             fi
 
-            # Allow Node to bind to port 80
+            # Allow Node to bind to port 80 without sudo
             NODE_BIN=$(readlink -f "$(which node)")
             sudo setcap 'cap_net_bind_service=+ep' "$NODE_BIN" || true
 
-            # Start/restart service with pm2
+            echo "==> Starting (or restarting) app on port 80 via PM2"
             if pm2 list | grep -q "hello-api"; then
               pm2 restart hello-api
             else
@@ -68,10 +93,13 @@ jobs:
             fi
             pm2 save
 
-            # Enable pm2 startup on boot
+            echo "==> Enabling PM2 autostart on reboot"
             sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u $USER --hp $HOME -y >/dev/null 2>&1 || true
 
-            # Open port 80 if firewall (ufw) is active
+            # Open port 80 if UFW firewall is active
             if command -v ufw >/dev/null 2>&1 && sudo ufw status | grep -q active; then
               sudo ufw allow 80/tcp || true
             fi
+
+            echo "==> Deployment completed"
+
