@@ -7,63 +7,60 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      # 1) Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1) Copy repo to VM (no git pull on VM)
-      - name: Copy files to VM
-        uses: appleboy/scp-action@v0.1.7
+      # 2) Rsync code to VM (no git pull on VM)
+      - name: Sync files to VM with rsync
+        uses: burnett01/rsync-deployments@5.2
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # uncomment next line ONLY if your .pem has a passphrase
-          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          source: "."
-          target: ${{ secrets.DEPLOY_PATH || '/opt/hello-api' }}
-          rm: true
-          strip_components: 0
-          overwrite: true
+          switches: -avz --delete --exclude '.git*' --exclude '.github*' --exclude 'node_modules'
+          path: .
+          remote_path: ${{ secrets.DEPLOY_PATH || '/opt/hello-api' }}
+          remote_host: ${{ secrets.SSH_HOST }}
+          remote_user: ${{ secrets.SSH_USERNAME }}
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      # 2) Setup runtime and (re)start app on port 80
+      # 3) Install Node & start app
       - name: Configure and start service on VM
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          # passphrase: ${{ secrets.SSH_PASSPHRASE }}   # uncomment if key is passphrase-protected
           script: |
             set -e
 
-            # Node & PM2
+            # Ensure Node.js & npm installed
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
               sudo apt-get install -y nodejs
             fi
-            sudo npm i -g pm2
+
+            # Install pm2 globally if not present
+            if ! command -v pm2 >/dev/null 2>&1; then
+              sudo npm install -g pm2
+            fi
 
             APP_DIR="${DEPLOY_PATH:-/opt/hello-api}"
-            sudo mkdir -p "$APP_DIR"
-            sudo chown -R $USER:$USER "$APP_DIR"
             cd "$APP_DIR"
 
-            # optional cleanup if you dislike CI files on the VM
-            rm -rf .git || true
-
-            # install deps
+            # Install app dependencies
             if [ -f package-lock.json ]; then
               npm ci --omit=dev
             else
               npm install --omit=dev
             fi
 
-            # allow binding to port 80
+            # Allow Node to bind to port 80
             NODE_BIN=$(readlink -f "$(which node)")
             sudo setcap 'cap_net_bind_service=+ep' "$NODE_BIN" || true
 
-            # start/restart via PM2
+            # Start/restart service with pm2
             if pm2 list | grep -q "hello-api"; then
               pm2 restart hello-api
             else
@@ -71,10 +68,10 @@ jobs:
             fi
             pm2 save
 
-            # autostart on reboot
+            # Enable pm2 startup on boot
             sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u $USER --hp $HOME -y >/dev/null 2>&1 || true
 
-            # open port 80 if ufw is active
+            # Open port 80 if firewall (ufw) is active
             if command -v ufw >/dev/null 2>&1 && sudo ufw status | grep -q active; then
               sudo ufw allow 80/tcp || true
             fi
