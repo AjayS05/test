@@ -64,11 +64,7 @@ jobs:
             cd "$APP_DIR"
 
             echo "==> Installing dependencies"
-            if [ -f package-lock.json ]; then
-              npm ci --omit=dev
-            else
-              npm install --omit=dev
-            fi
+            npm install --omit=dev
 
             NODE_BIN=$(readlink -f "$(which node)")
             sudo setcap 'cap_net_bind_service=+ep' "$NODE_BIN" || true
