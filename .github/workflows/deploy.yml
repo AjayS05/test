@@ -9,16 +9,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Checkout repo
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2) Create a tarball to avoid copy issues
+      # Create tarball directly from git commit (no file-change errors)
       - name: Create deploy tarball
         run: |
-          tar --exclude='.git' --exclude='.github' --exclude='node_modules' -czf app.tar.gz .
+          git archive --format=tar.gz -o app.tar.gz HEAD
 
-      # 3) Upload tarball to VM
       - name: Upload tarball to VM
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -28,7 +26,6 @@ jobs:
           source: "app.tar.gz"
           target: "/home/azureuser/"
 
-      # 4) Extract, install, and start app
       - name: Deploy & start app on VM
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -47,56 +44,3 @@ jobs:
             echo "==> Extracting tarball into $APP_DIR"
             tar -xzf "$TAR_PATH" -C "$APP_DIR"
             rm -f "$TAR_PATH"
-
-            echo "==> Listing files"
-            ls -la "$APP_DIR"
-
-            if [ ! -f "$APP_DIR/package.json" ]; then
-              echo "ERROR: package.json not found in $APP_DIR"
-              exit 1
-            fi
-
-            # Install Node.js if missing
-            if ! command -v node >/dev/null 2>&1; then
-              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-              sudo apt-get install -y nodejs
-            fi
-
-            # Install PM2 if missing
-            if ! command -v pm2 >/dev/null 2>&1; then
-              sudo npm install -g pm2
-            fi
-
-            cd "$APP_DIR"
-
-            echo "==> Installing dependencies"
-            npm install --omit=dev
-
-            # Ensure app.js listens on 0.0.0.0:80
-            if ! grep -q "0.0.0.0" app.js; then
-              echo "WARNING: app.js may not bind to 0.0.0.0. Please check manually."
-            fi
-
-            # Give Node binary permission for port 80
-            for p in /usr/bin/node /usr/local/bin/node "$(readlink -f "$(which node)")"; do
-              [ -x "$p" ] && sudo setcap 'cap_net_bind_service=+ep' "$p" || true
-            done
-
-            echo "==> Starting app with PM2"
-            if pm2 list | grep -q "hello-api"; then
-              pm2 restart hello-api
-            else
-              pm2 start npm --name "hello-api" -- start
-            fi
-            pm2 save
-
-            echo "==> PM2 status"
-            pm2 status
-
-            echo "==> Checking if port 80 is open"
-            sudo ss -ltnp | grep ':80' || true
-
-            echo "==> Local test inside VM"
-            curl -i http://localhost/sayHello || true
-
-            echo "==> Deployment finished"
